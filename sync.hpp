@@ -39,7 +39,7 @@ bool set_delays(is::ServiceClient &client, vector<string> const &entities,
     }
     is::log::info("Setting new delays. Try {}/3", 3 - n_tries + 1);
 
-    auto msgs = client.receive_until(high_resolution_clock::now() + 500ms, ids,
+    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
                                      is::policy::discard_others);
     if (msgs.size() == entities.size()) {
       return true;
@@ -60,7 +60,7 @@ arma::vec get_delays(is::ServiceClient &client,
     }
     is::log::info("Requesting currents delays. Try {}/3", 3 - n_tries + 1);
 
-    auto msgs = client.receive_until(high_resolution_clock::now() + 500ms, ids,
+    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
                                      is::policy::discard_others);
 
     if (msgs.size() == entities.size()) {
@@ -84,9 +84,9 @@ bool set_sampling_rate(is::ServiceClient &client, SyncRequest const &request) {
       ids.push_back(client.request(e + ".set_sample_rate",
                                    is::msgpack(request.sampling_rate)));
     }
-    is::log::info("Requesting currents delays. Try {}/3", 3 - n_tries + 1);
+    is::log::info("Setting sampling rate. Try {}/3", 3 - n_tries + 1);
 
-    auto msgs = client.receive_until(high_resolution_clock::now() + 500ms, ids,
+    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
                                      is::policy::discard_others);
     if (msgs.size() == ids.size())
       return true;
@@ -97,11 +97,15 @@ bool set_sampling_rate(is::ServiceClient &client, SyncRequest const &request) {
 }
 
 arma::mat get_timestamps(is::Connection &is, vector<is::QueueInfo> tags,
-                         int n_samples, int64_t period) {
+                         unsigned int n_samples, unsigned int discard_samples,
+                         int64_t period) {
+
   arma::mat timestamps(n_samples, tags.size(), arma::fill::zeros);
   is::log::info("Consuming timestamps. Period: {}", period);
   for (unsigned int r = 0; r < timestamps.n_rows; ++r) {
     auto msgs = is.consume_sync(tags, period);
+    if (r < discard_samples)
+      continue;
     auto first = msgs.begin();
     for (unsigned int c = 0; c < timestamps.n_cols; ++c) {
       timestamps(r, c) = is::msgpack<Timestamp>(*first++).nanoseconds;
@@ -120,7 +124,7 @@ int64_t get_period(SamplingRate sr) {
   throw runtime_error("Undefined SamplingRate");
 }
 
-arma::vec compute_delays(arma::mat const &samples, int64_t period) {
+arma::vec compute_delays(arma::mat const &samples) {
   std::vector<arma::uvec> n_max(samples.n_cols);
   auto n_row = 0;
   samples.each_row([&](arma::rowvec const &row) {
@@ -147,12 +151,13 @@ arma::vec compute_delays(arma::mat const &samples, int64_t period) {
   (diff / 1e6).print("diff");
 
   arma::vec delays;
-  if (arma::approx_equal(diff,
-                         arma::ones<arma::mat>(arma::size(diff)) * period * 1e6,
-                         "absdiff", 0.05 * period * 1e6)) {
-    delays = arma::vectorise(arma::mean(samples_delays) / 1e6);
-    delays.print("delays");
-  }
+  samples_delays.each_col([&](arma::vec col) {
+    col.shed_row(col.index_min());
+    col.shed_row(col.index_max());
+    delays = join_vert(delays, arma::vec({arma::mean(col) / 1e6}));
+  });
+
+  delays.print("delays");
   return delays;
 }
 
@@ -163,6 +168,8 @@ Status sync_entities(string uri, SyncRequest request) {
   if (!set_sampling_rate(client, request)) {
     return status::error("Failed to set sampling rate");
   }
+
+  std::this_thread::sleep_for(1s); // trust-me, it's necessery!!
 
   arma::vec delays = get_delays(client, request.entities);
   if (delays.empty()) {
@@ -184,8 +191,8 @@ Status sync_entities(string uri, SyncRequest request) {
   for (int tries = 0; tries < tries_limit; ++tries) {
     is::log::info("Try to sync. {}/{}", tries + 1, tries_limit);
 
-    arma::mat timestamps = get_timestamps(is, tags, 10, period);
-    arma::vec delays_diff = compute_delays(timestamps, period);
+    arma::mat timestamps = get_timestamps(is, tags, 13, 3, period);
+    arma::vec delays_diff = compute_delays(timestamps);
 
     if (delays_diff.n_elem == 0) {
       is::log::warn("Empty delays matrix");
