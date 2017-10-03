@@ -121,14 +121,34 @@ int64_t get_period(SamplingRate sr) {
 }
 
 arma::vec compute_delays(arma::mat const &samples, int64_t period) {
-  arma::mat samples_delays = arma::max(samples, 1) - samples.each_col();
-  arma::mat diff = arma::diff(samples);
+  std::vector<arma::uvec> n_max(samples.n_cols);
+  auto n_row = 0;
+  samples.each_row([&](arma::rowvec const &row) {
+    n_max[arma::index_max(row)] =
+        join_vert(n_max[arma::index_max(row)],
+                  arma::uvec({static_cast<arma::uword>(n_row++)}));
+  });
+
+  auto row_indexes =
+      std::max_element(n_max.begin(), n_max.end(), [](auto lhs, auto rhs) {
+        return lhs.n_elem < rhs.n_elem;
+      });
+
+  if ((*row_indexes).n_elem < 5)
+    return arma::vec();
+
+  is::log::info("Using {} samples", (*row_indexes).n_elem);
+  arma::mat filtered_samples = samples.rows(*row_indexes);
+
+  arma::mat samples_delays =
+      arma::max(filtered_samples, 1) - filtered_samples.each_col();
+  arma::mat diff = arma::diff(filtered_samples);
   (samples_delays / 1e6).print("samples_delays");
   (diff / 1e6).print("diff");
+
   arma::vec delays;
   if (arma::approx_equal(diff,
-                         arma::ones<arma::mat>(arma::size(diff)) * period *
-  1e6,
+                         arma::ones<arma::mat>(arma::size(diff)) * period * 1e6,
                          "absdiff", 0.05 * period * 1e6)) {
     delays = arma::vectorise(arma::mean(samples_delays) / 1e6);
     delays.print("delays");
