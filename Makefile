@@ -1,34 +1,47 @@
-COMPILER = g++
-FLAGS = -std=c++14 -O3 -Wall -Werror -Wextra
+CXX = clang++
+CXXFLAGS += -std=c++14 -Wall -Werror
+DEBUGFLAGS = -g -fsanitize=address -fno-omit-frame-pointer
+RELEASEFLAGS = -O2
+BUILDFLAGS = $(RELEASEFLAGS)
+LDFLAGS += -L/usr/local/lib -I/usr/local/include \
+			`pkg-config --libs protobuf librabbitmq libSimpleAmqpClient`\
+			-lpthread -lboost_program_options -lboost_system -lboost_filesystem\
+			-lismsgs -larmadillo \
+			-Wl,--no-as-needed -Wl,--as-needed -ldl
+PROTOC = protoc
 
-SO_DEPS = $(shell pkg-config --libs --cflags libSimpleAmqpClient msgpack librabbitmq)
-SO_DEPS += -lboost_program_options -lpthread -larmadillo
+LOCAL_PROTOS_PATH = ./msgs/
+vpath %.proto $(LOCAL_PROTOS_PATH)
 
 MAINTAINER = mendonca
-SERVICE = sync
-VERSION = 1.0
+SERVICE = time-sync
+VERSION = 1
 LOCAL_REGISTRY = git.is:5000
 
 all: $(SERVICE) test
 
 clean:
-	rm -f $(SERVICE) test
+	rm -f *.o *.pb.cc *.pb.h $(SERVICE) test
 
-$(SERVICE): $(SERVICE).cpp $(SERVICE).hpp
-	$(COMPILER) $^ -o $@ $(FLAGS) $(SO_DEPS)
+$(SERVICE): $(SERVICE).o
+	$(CXX) $^ $(LDFLAGS) $(BUILDFLAGS) -o $@
 
-test: test.cpp
-	$(COMPILER) $^ -o $@ $(FLAGS) $(SO_DEPS) 
+test: test.o
+	$(CXX) $^ $(LDFLAGS) $(BUILDFLAGS) -o $@
 
-docker: $(SERVICE)
+.PRECIOUS: %.pb.cc
+%.pb.cc: %.proto
+	$(PROTOC) -I $(LOCAL_PROTOS_PATH) --cpp_out=. $<
+
+docker:
 	rm -rf libs/
 	mkdir libs/
 	lddcp $(SERVICE) libs/
 	docker build -t $(MAINTAINER)/$(SERVICE):$(VERSION) .
 	rm -rf libs/
-	
+
 push_local: docker
-	docker tag $(MAINTAINER)/$(SERVICE):$(VERSION) $(LOCAL_REGISTRY)/$(SERVICE):$(VERSION) 
+	docker tag $(MAINTAINER)/$(SERVICE):$(VERSION) $(LOCAL_REGISTRY)/$(SERVICE):$(VERSION)
 	docker push $(LOCAL_REGISTRY)/$(SERVICE):$(VERSION)
 
 push_cloud: docker

@@ -1,13 +1,14 @@
 #ifndef SYNC_SERVICE_UTILS_HPP
 #define SYNC_SERVICE_UTILS_HPP
 
+#include <is/msgs/camera.pb.h>
+#include <is/msgs/common.pb.h>
 #include <armadillo>
 #include <boost/circular_buffer.hpp>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <is/is.hpp>
-#include <is/msgs/common.hpp>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -17,203 +18,281 @@ namespace is {
 using namespace std;
 using namespace std::chrono;
 using namespace std::chrono_literals;
-using namespace is::msg::common;
+using namespace is::common;
+using namespace is::vision;
 using namespace arma;
 
-bool set_delays(is::ServiceClient &client, vector<string> const &entities,
-                arma::vec const &delays) {
+inline std::string request(rmq::Channel::ptr_t const& channel, std::string const& queue,
+                           std::string const& endpoint,
+                           is::rmq::BasicMessage::ptr_t const& message) {
+  auto id = is::make_random_uid();
+  message->ReplyTo(queue);
+  message->CorrelationId(id);
+  channel->BasicPublish("is", endpoint, message);
+  return id;
+}
+
+std::map<std::string /* endpoint */, is::rmq::Envelope::ptr_t> batch_request(
+    is::rmq::Channel::ptr_t& channel, std::string const& queue,
+    std::map<std::string /* endpoint */, is::rmq::BasicMessage::ptr_t> messages, int n_tries = 1,
+    is::pb::Duration const& duration = is::pb::TimeUtil::SecondsToDuration(1)) {
+  /*
+    Returns a map of envelopes only with the successed replies received.
+  */
+  std::map<std::string /* endpoint */, is::rmq::Envelope::ptr_t> envelopes;
+  while (n_tries) {
+    std::map<std::string /* id */, std::string /* endpoint */> ids;
+    std::transform(
+        messages.begin(), messages.end(), std::inserter(ids, ids.end()), [&](auto& key_value) {
+          auto endpoint = key_value.first;
+          auto message = key_value.second;
+          return std::make_pair(is::request(channel, queue, endpoint, message), endpoint);
+        });
+
+    auto deadline = is::current_time() + duration;
+    is::rmq::Envelope::ptr_t envelope;
+    for (;;) {
+      envelope = is::consume_until(channel, queue, deadline);
+      if (envelope == nullptr)  // deadline exceeded, go to next try
+        break;
+      auto pos = ids.find(envelope->Message()->CorrelationId());
+      if (pos != ids.end()) {
+        auto endpoint = pos->second;
+        envelopes[endpoint] = envelope;
+        messages.erase(endpoint);
+      }
+      if (messages.empty())
+        return envelopes;
+    }
+    n_tries--;
+  }
+  return envelopes;
+}
+
+template <typename Request>
+std::map<std::string /* endpoint */, is::rmq::Envelope::ptr_t> batch_request(
+    is::rmq::Channel::ptr_t& channel, std::string const& queue,
+    std::map<std::string /* endpoint */, Request> requests, int n_tries = 1,
+    is::pb::Duration const& duration = is::pb::TimeUtil::SecondsToDuration(1)) {
+  std::map<std::string /* endpoint */, is::rmq::BasicMessage::ptr_t> messages;
+  std::transform(requests.begin(), requests.end(), std::inserter(messages, messages.end()),
+                 [](auto& key_value) {
+                   auto endpoint = key_value.first;
+                   auto message = is::pack_proto(key_value.second);
+                   return std::make_pair(endpoint, message);
+                 });
+  return batch_request(channel, queue, messages, n_tries, duration);
+}
+
+bool set_sampling_rate(is::rmq::Channel::ptr_t& channel, std::string const& queue,
+                       SyncRequest const& sync_request) {
+  std::map<std::string /* endpoints */, CameraConfig> requests;
+  auto entities = sync_request.entities();
+  CameraConfig camera_config;
+  *camera_config.mutable_sampling() = sync_request.sampling();
+  std::transform(entities.begin(), entities.end(), std::inserter(requests, requests.end()),
+                 [&camera_config](auto& entity) {
+                   return std::make_pair(fmt::format("{}.SetConfig", entity), camera_config);
+                 });
+
+  auto replies = batch_request(channel, queue, requests);
+  if (replies.size() != entities.size())
+    return false;
+
+  return std::all_of(replies.begin(), replies.end(), [](auto& key_value) {
+    auto status = is::rpc_status(key_value.second);
+    return status.code() == StatusCode::OK;
+  });
+}
+
+bool set_delays(is::rmq::Channel::ptr_t& channel, std::string const& queue,
+                SyncRequest const& sync_request, arma::vec const& delays) {
+  std::map<std::string /* endpoints */, CameraConfig> requests;
+  auto entities = sync_request.entities();
   if (entities.size() != delays.n_elem) {
-    is::log::warn("Invalid size of arma::vec delays");
+    is::warn("Invalid size of arma::vec delays");
     return false;
   }
-
-  auto n_tries = 3;
-  while (n_tries) {
-
-    std::vector<std::string> ids;
-    for (size_t it = 0; it < entities.size(); ++it) {
-      Delay delay;
-      delay.milliseconds = static_cast<int64_t>(delays(it));
-      ids.push_back(
-          client.request(entities[it] + ".set_delay", is::msgpack(delay)));
-    }
-    is::log::info("Setting new delays. Try {}/3", 3 - n_tries + 1);
-
-    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
-                                     is::policy::discard_others);
-    if (msgs.size() == entities.size()) {
-      return true;
-    }
-    n_tries--;
+  for (auto i = 0; i < entities.size(); ++i) {
+    CameraConfig camera_config;
+    camera_config.mutable_sampling()->mutable_delay()->set_value(static_cast<float>(delays[i]));
+    requests[fmt::format("{}.SetConfig", entities[i])] = camera_config;
   }
-  is::log::warn("Can't set all delays.");
-  return false;
+
+  auto replies = batch_request(channel, queue, requests);
+  if (replies.size() != entities.size())
+    return false;
+
+  return std::all_of(replies.begin(), replies.end(), [](auto& key_value) {
+    auto status = is::rpc_status(key_value.second);
+    return status.code() == StatusCode::OK;
+  });
 }
 
-arma::vec get_delays(is::ServiceClient &client,
-                     vector<string> const &entities) {
-  auto n_tries = 3;
-  while (n_tries) {
-    std::vector<std::string> ids;
-    for (auto &entity : entities) {
-      ids.push_back(client.request(entity + ".get_delay", is::msgpack(0)));
-    }
-    is::log::info("Requesting currents delays. Try {}/3", 3 - n_tries + 1);
+arma::vec get_delays(is::rmq::Channel::ptr_t& channel, std::string const& queue,
+                     SyncRequest const& sync_request) {
+  std::map<std::string /* endpoints */, FieldSelector> requests;
+  auto entities = sync_request.entities();
+  FieldSelector field_selector;
+  field_selector.add_fields(CameraConfigFields::SAMPLING_SETTINGS);
+  std::transform(entities.begin(), entities.end(), std::inserter(requests, requests.end()),
+                 [&field_selector](auto& entity) {
+                   return std::make_pair(fmt::format("{}.GetConfig", entity), field_selector);
+                 });
 
-    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
-                                     is::policy::discard_others);
+  auto replies = batch_request(channel, queue, requests);
+  if (replies.size() != entities.size())
+    return arma::vec();
 
-    if (msgs.size() == entities.size()) {
-      arma::vec delays(msgs.size());
-      std::transform(msgs.begin(), msgs.end(), delays.begin(), [&](auto msg) {
-        return is::msgpack<Delay>(msg.second).milliseconds;
-      });
-      return delays;
-    }
-    n_tries--;
-  }
-  is::log::warn("Can't get all delays.");
-  return arma::vec();
-}
-
-bool set_sampling_rate(is::ServiceClient &client, SyncRequest const &request) {
-  auto n_tries = 3;
-  while (n_tries) {
-    std::vector<std::string> ids;
-    for (auto &e : request.entities) {
-      ids.push_back(client.request(e + ".set_sample_rate",
-                                   is::msgpack(request.sampling_rate)));
-    }
-    is::log::info("Setting sampling rate. Try {}/3", 3 - n_tries + 1);
-
-    auto msgs = client.receive_until(high_resolution_clock::now() + 2s, ids,
-                                     is::policy::discard_others);
-    if (msgs.size() == ids.size())
-      return true;
-
-    n_tries--;
-  }
-  return false;
-}
-
-arma::mat get_timestamps(is::Connection &is, vector<is::QueueInfo> tags,
-                         unsigned int n_samples, unsigned int discard_samples,
-                         int64_t period) {
-
-  arma::mat timestamps(n_samples, tags.size(), arma::fill::zeros);
-  is::log::info("Consuming timestamps. Period: {}", period);
-  for (unsigned int r = 0; r < timestamps.n_rows; ++r) {
-    auto msgs = is.consume_sync(tags, period);
-    if (r < discard_samples)
-      continue;
-    auto first = msgs.begin();
-    for (unsigned int c = 0; c < timestamps.n_cols; ++c) {
-      timestamps(r, c) = is::msgpack<Timestamp>(*first++).nanoseconds;
-    }
-  }
-  return timestamps;
-}
-
-int64_t get_period(SamplingRate sr) {
-  if (sr.period) {
-    return *sr.period;
-  }
-  if (sr.rate) {
-    return static_cast<int64_t>(1000.0 / *sr.rate);
-  }
-  throw runtime_error("Undefined SamplingRate");
-}
-
-arma::vec compute_delays(arma::mat const &samples) {
-  std::vector<arma::uvec> n_max(samples.n_cols);
-  auto n_row = 0;
-  samples.each_row([&](arma::rowvec const &row) {
-    n_max[arma::index_max(row)] =
-        join_vert(n_max[arma::index_max(row)],
-                  arma::uvec({static_cast<arma::uword>(n_row++)}));
+  auto all_ok = std::all_of(replies.begin(), replies.end(), [](auto& key_value) {
+    auto status = is::rpc_status(key_value.second);
+    return status.code() == StatusCode::OK;
   });
 
-  auto row_indexes =
-      std::max_element(n_max.begin(), n_max.end(), [](auto lhs, auto rhs) {
-        return lhs.n_elem < rhs.n_elem;
-      });
+  if (!all_ok)
+    return arma::vec();
+
+  arma::vec delays;
+  for (auto entity : entities) {
+    auto envelope = replies[fmt::format("{}.GetConfig", entity)];
+    auto camera_config = is::unpack<CameraConfig>(envelope);
+    if (camera_config) {
+      auto delay = static_cast<float>(camera_config->sampling().delay().value());
+      delays = arma::join_vert(delays, arma::vec({delay}));
+    } else {
+      return arma::vec();
+    }
+  }
+  return delays;
+}
+
+arma::mat get_timestamps(is::rmq::Channel::ptr_t& channel, std::string const& queue,
+                         SyncRequest const& sync_request, unsigned int n_samples = 13,
+                         unsigned int discard_samples = 3) {
+  auto entities = sync_request.entities();
+
+  std::vector<std::string> topics;
+  std::transform(entities.begin(), entities.end(), std::back_inserter(topics),
+                 [](auto& entity) { return fmt::format("{}.Timestamp", entity); });
+
+  is::subscribe(channel, queue, topics);
+
+  arma::mat output;
+  while (n_samples--) {
+    std::map<std::string, double> timestamps;
+    for (;;) {
+      auto envelope = is::consume(channel, queue);
+      auto timestamp = *is::unpack<is::pb::Timestamp>(envelope);
+      auto timestamp_ns = static_cast<double>(is::pb::TimeUtil::TimestampToNanoseconds(timestamp));
+      timestamps[envelope->RoutingKey()] = timestamp_ns;
+
+      if (timestamps.size() == topics.size()) {
+        arma::mat window;
+        for (auto& entity : entities) {
+          auto endpoint = fmt::format("{}.Timestamp", entity);
+          window = arma::join_horiz(window, arma::vec({timestamps[endpoint]}));
+        }
+        output = arma::join_vert(output, window);
+        break;
+      }
+    }
+  }
+
+  is::unsubscribe(channel, queue, topics);
+  return output.rows(discard_samples - 1, output.n_rows - 1);
+}
+
+double get_period(SyncRequest const& sync_request) {
+  if (sync_request.sampling().rate_case() == SamplingSettings::RateCase::kFrequency) {
+    return 1.0 / sync_request.sampling().frequency();
+  } else {
+    return sync_request.sampling().period();
+  }
+}
+
+arma::vec compute_delays(arma::mat const& samples) {
+  std::vector<arma::uvec> n_max(samples.n_cols);
+  auto n_row = 0;
+  samples.each_row([&](arma::rowvec const& row) {
+    n_max[arma::index_max(row)] =
+        join_vert(n_max[arma::index_max(row)], arma::uvec({static_cast<arma::uword>(n_row++)}));
+  });
+
+  auto row_indexes = std::max_element(n_max.begin(), n_max.end(),
+                                      [](auto lhs, auto rhs) { return lhs.n_elem < rhs.n_elem; });
 
   if ((*row_indexes).n_elem < 5)
     return arma::vec();
 
-  is::log::info("Using {} samples", (*row_indexes).n_elem);
+  is::info("Using {} samples", (*row_indexes).n_elem);
   arma::mat filtered_samples = samples.rows(*row_indexes);
 
-  arma::mat samples_delays =
-      arma::max(filtered_samples, 1) - filtered_samples.each_col();
-  arma::mat diff = arma::diff(filtered_samples);
+  arma::mat samples_delays = arma::max(filtered_samples, 1) - filtered_samples.each_col();
   (samples_delays / 1e6).print("samples_delays");
-  (diff / 1e6).print("diff");
 
   arma::vec delays;
   samples_delays.each_col([&](arma::vec col) {
     col.shed_row(col.index_min());
     col.shed_row(col.index_max());
-    delays = join_vert(delays, arma::vec({arma::mean(col) / 1e6}));
+    delays = join_vert(delays, arma::vec({arma::mean(col) / 1e9}));
   });
 
   delays.print("delays");
   return delays;
 }
 
-Status sync_entities(string uri, SyncRequest request) {
-  auto is = is::connect(uri);
-  auto client = is::make_client(is);
+Status sync_entities(is::rmq::Channel::ptr_t& channel, SyncRequest const& request) {
+  if (request.entities_size() < 2)
+    return is::make_status(StatusCode::INVALID_ARGUMENT,
+                           "SyncRequest must have at least 2 entities");
+  if (request.sampling().rate_case() == SamplingSettings::RateCase::RATE_NOT_SET)
+    return is::make_status(StatusCode::INVALID_ARGUMENT, "\'rate\' field on sampling must be set");
 
-  if (!set_sampling_rate(client, request)) {
-    return status::error("Failed to set sampling rate");
+  auto queue = is::declare_queue(channel);
+
+  if (!set_sampling_rate(channel, queue, request)) {
+    return is::make_status(StatusCode::INTERNAL_ERROR, "Failed to set sampling rate");
   }
 
-  std::this_thread::sleep_for(1s); // trust-me, it's necessery!!
+  std::this_thread::sleep_for(1s);  // trust-me, it's necessary!!
 
-  arma::vec delays = get_delays(client, request.entities);
+  arma::vec delays = get_delays(channel, queue, request);
   if (delays.empty()) {
-    return status::error("Failed to get current delays");
+    return is::make_status(StatusCode::INTERNAL_ERROR, "Failed to get current delays");
   }
+
   delays.print("Current Delays");
 
-  // Create timestamp subscribers
-  is::log::info("Subscribe timestamps");
-  vector<is::QueueInfo> tags;
-  for (auto &e : request.entities) {
-    tags.push_back(is.subscribe(e + ".timestamp"));
-  }
-
-  auto period = get_period(request.sampling_rate);
-  auto sync_threshold = 3;
+  auto sync_threshold = 3.0 / 1e3;  // seconds
   const int tries_limit = 5;
 
   for (int tries = 0; tries < tries_limit; ++tries) {
-    is::log::info("Try to sync. {}/{}", tries + 1, tries_limit);
+    is::info("Try to sync. {}/{}", tries + 1, tries_limit);
 
-    arma::mat timestamps = get_timestamps(is, tags, 13, 3, period);
+    arma::mat timestamps = get_timestamps(channel, queue, request);
     arma::vec delays_diff = compute_delays(timestamps);
-
     if (delays_diff.n_elem == 0) {
-      is::log::warn("Empty delays matrix");
+      is::warn("Empty delays matrix");
       continue;
     }
 
     if (arma::any(delays_diff > sync_threshold)) {
+      auto period = get_period(request);
       delays += delays_diff;
       delays.elem(arma::find(delays >= period)) -= period;
       delays.print("New Delays");
-      if (!set_delays(client, request.entities, delays))
-        is::log::warn("Failed to set delays");
+      if (!set_delays(channel, queue, request, delays))
+        is::warn("Failed to set delays");
       continue;
     }
-    is::log::info("Sync ok");
-    return status::ok;
+    is::info("Sync ok");
+    return is::make_status(StatusCode::OK);
   }
-  is::log::warn("Failed to sync");
-  return status::error("Failed to sync");
+  is::warn("Failed to sync");
+  return is::make_status(StatusCode::FAILED_PRECONDITION,
+                         "Failed to sync. Number of tries exceeded.");
 }
 
-} // ::is
+}  // ::is
 
-#endif // SYNC_SERVICE_UTILS_HPP
+#endif  // SYNC_SERVICE_UTILS_HPP

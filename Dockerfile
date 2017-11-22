@@ -1,5 +1,6 @@
 FROM ubuntu:16.04
-MAINTAINER mendonca.felippe@gmail.com
+LABEL maintainer mendonca.felippe@gmail.com
 
-ADD sync /opt
+WORKDIR /opt
+ADD time-sync .
 ADD libs/ /usr/lib/
