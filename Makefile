@@ -18,12 +18,12 @@ SERVICE = time-sync
 VERSION = 1
 LOCAL_REGISTRY = git.is:5000
 
-all: $(SERVICE) test
+all: service test
 
 clean:
-	rm -f *.o *.pb.cc *.pb.h $(SERVICE) test
+	rm -f *.o *.pb.cc *.pb.h service test
 
-$(SERVICE): $(SERVICE).o
+service: service.o
 	$(CXX) $^ $(LDFLAGS) $(BUILDFLAGS) -o $@
 
 test: test.o
@@ -36,7 +36,7 @@ test: test.o
 docker:
 	rm -rf libs/
 	mkdir libs/
-	lddcp $(SERVICE) libs/
+	lddcp service libs/
 	docker build -t $(MAINTAINER)/$(SERVICE):$(VERSION) .
 	rm -rf libs/
 

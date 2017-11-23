@@ -20,11 +20,12 @@ int main(int argc, char* argv[]) {
 
   is::ServiceProvider provider;
   provider.connect(channel);
-  auto queue = provider.declare_queue("Time", "");
+  auto provider_queue = provider.declare_queue("Time", "");
+  auto queue = is::declare_queue(channel);
 
   provider.delegate<SyncRequest, is::pb::Empty>(
-      queue, "Sync", [&channel](SyncRequest const& request, is::pb::Empty*) -> Status {
-        return is::sync_entities(channel, request);
+      provider_queue, "Sync", [&](SyncRequest const& request, is::pb::Empty*) -> Status {
+        return is::sync_entities(channel, queue, request);
       });
 
   provider.run();

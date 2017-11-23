@@ -241,14 +241,12 @@ arma::vec compute_delays(arma::mat const& samples) {
   return delays;
 }
 
-Status sync_entities(is::rmq::Channel::ptr_t& channel, SyncRequest const& request) {
+Status sync_entities(is::rmq::Channel::ptr_t& channel, std::string const& queue, SyncRequest const& request) {
   if (request.entities_size() < 2)
     return is::make_status(StatusCode::INVALID_ARGUMENT,
                            "SyncRequest must have at least 2 entities");
   if (request.sampling().rate_case() == SamplingSettings::RateCase::RATE_NOT_SET)
     return is::make_status(StatusCode::INVALID_ARGUMENT, "\'rate\' field on sampling must be set");
-
-  auto queue = is::declare_queue(channel);
 
   if (!set_sampling_rate(channel, queue, request)) {
     return is::make_status(StatusCode::INTERNAL_ERROR, "Failed to set sampling rate");
