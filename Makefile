@@ -1,40 +1,40 @@
 CXX = clang++
-CXXFLAGS += -std=c++14
-LDFLAGS += -L/usr/local/lib -I/usr/local/include \
-			`pkg-config --libs protobuf librabbitmq libSimpleAmqpClient`\
-			-lpthread -lboost_program_options -lboost_filesystem -lboost_system -lismsgs -larmadillo\
-			-lprometheus-cpp -lopentracing -lzipkin -lzipkin_opentracing
+CXXFLAGS += -std=c++14 -Wall
+LDFLAGS += -I/usr/local/include -L/usr/local/lib -pthread -lpthread \
+	-lprotobuf -lismsgs -lrabbitmq -lSimpleAmqpClient \
+	-lboost_system -lboost_program_options
 PROTOC = protoc
-
 LOCAL_PROTOS_PATH = ./msgs/
+
 vpath %.proto $(LOCAL_PROTOS_PATH)
 
 MAINTAINER = viros
-SERVICE = time-sync
+SERVICE = sync
+TEST = test
 VERSION = 1
-LOCAL_REGISTRY = git.is:5000
+LOCAL_REGISTRY = ninja.local:5000
 
 all: debug
 
 debug: CXXFLAGS += -g 
 debug: LDFLAGS += -fsanitize=address -fno-omit-frame-pointer
-debug: service test
+debug: $(SERVICE) $(TEST)
 
-release: CXXFLAGS += -Wall -Werror -O2
-release: service
+release: CXXFLAGS += -Werror -O2
+release: $(SERVICE)
 
-clean:
-	rm -f *.o *.pb.cc *.pb.h service test
-
-test: test.o 
+$(SERVICE): $(SERVICE).o 
 	$(CXX) $^ $(LDFLAGS) -o $@
 
-service: service.o 
+$(TEST): $(TEST).o 
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 .PRECIOUS: %.pb.cc
 %.pb.cc: %.proto
 	$(PROTOC) -I $(LOCAL_PROTOS_PATH) --cpp_out=. $<
+
+clean:
+	rm -f *.o *.pb.cc *.pb.h $(SERVICE) $(TEST)
 
 docker: 
 	docker build -t $(MAINTAINER)/$(SERVICE):$(VERSION) --build-arg=SERVICE=$(SERVICE) .

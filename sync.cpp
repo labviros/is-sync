@@ -1,6 +1,7 @@
 #include <is/msgs/common.pb.h>
 #include <google/protobuf/empty.pb.h>
-#include <is/is.hpp>
+#include <is/cli.hpp>
+#include <is/rpc.hpp>
 #include "sync.hpp"
 
 using namespace is::common;

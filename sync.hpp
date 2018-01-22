@@ -8,7 +8,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
-#include <is/is.hpp>
+#include <is/core.hpp>
 #include <limits>
 #include <string>
 #include <tuple>
