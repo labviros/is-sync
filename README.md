@@ -1,15 +1,38 @@
 is-sync
 ===
-This repository contains a service that syncs resources from different entities. All entities must publish their Timestamp and also be capable to set a delay at one sampling period. This service will only works if all computer nodes are synced. For that, we recommend using a [NTP](http://www.ntp.org/), which is a protocol that synchronize the clocks of computers over a network. The command below install the necessary dependencies to use NTP.
+This repository contains a service that syncs resources from different entities. 
+All entities must publish their Timestamp and also be capable to set a delay at one sampling period.
+This service will only work if the clock of all computer nodes are synced. For that we recommend using [chrony](https://chrony.tuxfamily.org/) - a versatile implementation of the Network Time Protocol (NTP).
 
+- Install chrony on all computer nodes:
 ```shell
-$ sudo apt-get install ntp ntpdate
+$ sudo apt install chrony
 ```
 
-After installing the ntp configuration file (*/etc/ntp.conf*) must be modified. Comment all lines that starts with **pool** and add **server IP_ADDRESS** at the top. This ip address belongs to a machine that will be used as time reference. To accelerate the sync process, we also provide on this repository a [script](https://github.com/labviros/is-sync/blob/master/ntp-sync) that forces computer time adjustment and monitor (see below) offset from source. An offset less than 1 millisecond is acceptable to run all applications.
+- Choose one node to be the reference (i.e 10.60.0.3)
 
+- On the **reference node** add **allow 0/0** in /etc/chrony/chrony.conf to allow any user to connect to the server:
+```diff
++ allow 0/0
+```
+
+- On **other nodes** edit /etc/chrony/chrony.conf and remove all lines that start with *pool* and add one with our reference node:
+```diff
+- pool 2.debian.pool.ntp.org offline iburst
++ pool 10.60.0.3 iburst
+```
+
+- Restart chrony on every node:
 ```shell
-     remote         refid    st t when poll reach   delay   offset  jitter
-==========================================================================
- edge          LOCAL(0)       6 u   19   64    1    0.212   -0.175   0.000
+$ sudo service chrony restart
+```
+
+- Check the synchronism by running:
+```shell
+$ sudo chronyc sources
+
+210 Number of sources = 1
+MS Name/IP address         Stratum Poll Reach LastRx Last sample
+===============================================================================
+^* 10.60.0.3                     3   6    37    12  +8468ns[ +361us] +/-   14ms
  ```

@@ -1,6 +1,0 @@
-#!/bin/bash
-
-sudo service ntp stop
-sudo ntpdate -s $1
-sudo service ntp start
-watch ntpq -p
